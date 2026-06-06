@@ -69,6 +69,39 @@ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: Strin
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
+// JWT relay auth
+use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+use serde_derive::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
+    id: i64,
+    username: String,
+    #[serde(default)]
+    is_admin: bool,
+    exp: usize,
+}
+
+static RELAY_JWT_SECRET: Lazy<Option<String>> = Lazy::new(|| {
+    std::env::var("RELAY_JWT_SECRET").ok().filter(|s| !s.is_empty())
+});
+
+fn validate_relay_token(token: &str) -> bool {
+    let secret = match RELAY_JWT_SECRET.as_deref() {
+        Some(s) => s,
+        None => return true,
+    };
+    if token.is_empty() {
+        return false;
+    }
+    decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .is_ok()
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -687,8 +720,11 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !key.is_empty() && ph.licence_key != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+        let _ = key;
+        let id = ph.id;
+
+        if !validate_relay_token(&ph.token) {
+            log::warn!("Relay auth: rejected connection attempt from {} — invalid or missing token", addr);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -696,7 +732,7 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        let id = ph.id;
+
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
@@ -1187,6 +1223,19 @@ impl RendezvousServer {
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
+            // Send a dummy message so that RustDesk clients calling secure_tcp()
+            // (when logged into an API server) don't time out waiting for a
+            // KeyExchange.  The client sees any non-KeyExchange RendezvousMessage,
+            // skips key setup, and proceeds with an unencrypted channel - which is
+            // exactly what the OSS hbbs uses anyway.
+            {
+                let mut hello = RendezvousMessage::new();
+                hello.set_test_nat_response(TestNatResponse {
+                    port: 0,
+                    ..Default::default()
+                });
+                Self::send_to_sink(&mut sink, hello).await;
+            }
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
