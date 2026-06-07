@@ -623,6 +623,7 @@ impl RendezvousServer {
                                 }
                             }
                             log::debug!("KeyExchange: symmetric key established from {:?}", addr);
+                            return true;
                         } else {
                             log::error!("KeyExchange: key decryption failed from {:?}", addr);
                             return false;
