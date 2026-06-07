@@ -31,7 +31,8 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use hbb_common::tcp::Encrypt;
+use sodiumoxide::crypto::{box_, secretbox, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -50,9 +51,17 @@ enum Data {
 const REG_TIMEOUT: i32 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+struct SafeTcpStreamSink {
+    sink: TcpStreamSink,
+    encrypt: Option<Encrypt>,
+}
+struct SafeWsSink {
+    sink: WsSink,
+    encrypt: Option<Encrypt>,
+}
 enum Sink {
-    TcpStream(TcpStreamSink),
-    Ws(WsSink),
+    Tss(SafeTcpStreamSink),
+    Wss(SafeWsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -110,6 +119,8 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    secure_tcp_pk_b: box_::PublicKey,
+    secure_tcp_sk_b: box_::SecretKey,
 }
 
 #[derive(Clone)]
@@ -160,6 +171,7 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+        let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
@@ -174,6 +186,8 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                secure_tcp_pk_b,
+                secure_tcp_sk_b,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -595,10 +609,46 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
+                Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                    if ex.keys.len() == 2 {
+                        if let Ok(key) = Encrypt::decode(
+                            &ex.keys[1],
+                            &ex.keys[0],
+                            &self.inner.secure_tcp_sk_b,
+                        ) {
+                            if let Some(sink) = sink.as_mut() {
+                                match sink {
+                                    Sink::Tss(s) => s.encrypt = Some(Encrypt::new(key)),
+                                    Sink::Wss(s) => s.encrypt = Some(Encrypt::new(key)),
+                                }
+                            }
+                            log::debug!("KeyExchange: symmetric key established from {:?}", addr);
+                        } else {
+                            log::error!("KeyExchange: key decryption failed from {:?}", addr);
+                            return false;
+                        }
+                    } else {
+                        log::error!("KeyExchange: expected 2 keys, got {}", ex.keys.len());
+                        return false;
+                    }
+                }
                 _ => {}
             }
         }
         false
+    }
+
+    async fn key_exchange_phase1(&self, addr: SocketAddr, sink: &mut Option<Sink>) {
+        if let Some(sk) = &self.inner.sk {
+            let signed_pk = sign::sign(&self.inner.secure_tcp_pk_b.0, sk);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_key_exchange(KeyExchange {
+                keys: vec![Bytes::from(signed_pk)],
+                ..Default::default()
+            });
+            log::debug!("KeyExchange phase1: sending signed public key to {:?}", addr);
+            Self::send_to_sink(sink, msg_out).await;
+        }
     }
 
     #[inline]
@@ -867,11 +917,21 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
+                    Sink::Tss(s) => {
+                        let bytes = if let Some(enc) = s.encrypt.as_mut() {
+                            enc.enc(&bytes)
+                        } else {
+                            bytes
+                        };
+                        allow_err!(s.sink.send(Bytes::from(bytes)).await);
                     }
-                    Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+                    Sink::Wss(s) => {
+                        let bytes = if let Some(enc) = s.encrypt.as_mut() {
+                            enc.enc(&bytes)
+                        } else {
+                            bytes
+                        };
+                        allow_err!(s.sink.send(tungstenite::Message::Binary(bytes)).await);
                     }
                 }
             }
@@ -1212,9 +1272,19 @@ impl RendezvousServer {
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
+            sink = Some(Sink::Wss(SafeWsSink { sink: a, encrypt: None }));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
+                if let tungstenite::Message::Binary(mut bytes) = msg {
+                    if let Some(Sink::Wss(s)) = sink.as_mut() {
+                        if let Some(enc) = s.encrypt.as_mut() {
+                            let mut bm = hbb_common::bytes::BytesMut::from(bytes.as_slice());
+                            if enc.dec(&mut bm).is_err() {
+                                log::error!("WS decryption error from {:?}", addr);
+                                break;
+                            }
+                            bytes = bm.to_vec();
+                        }
+                    }
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                         break;
                     }
@@ -1222,21 +1292,19 @@ impl RendezvousServer {
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            // Send a dummy message so that RustDesk clients calling secure_tcp()
-            // (when logged into an API server) don't time out waiting for a
-            // KeyExchange.  The client sees any non-KeyExchange RendezvousMessage,
-            // skips key setup, and proceeds with an unencrypted channel - which is
-            // exactly what the OSS hbbs uses anyway.
-            {
-                let mut hello = RendezvousMessage::new();
-                hello.set_test_nat_response(TestNatResponse {
-                    port: 0,
-                    ..Default::default()
-                });
-                Self::send_to_sink(&mut sink, hello).await;
+            sink = Some(Sink::Tss(SafeTcpStreamSink { sink: a, encrypt: None }));
+            if !key.is_empty() {
+                self.key_exchange_phase1(addr, &mut sink).await;
             }
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(Sink::Tss(s)) = sink.as_mut() {
+                    if let Some(enc) = s.encrypt.as_mut() {
+                        if enc.dec(&mut bytes).is_err() {
+                            log::error!("TCP decryption error from {:?}", addr);
+                            break;
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
